@@ -1,0 +1,6 @@
+flask>=3.0,<4
+gunicorn>=22,<24
+requests>=2.31,<3
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<5
+rawpy>=0.22,<1

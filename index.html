@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HSH Studio · HDR editor</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/"><span class="mark">HSH</span><span class="brand-sub">Studio</span></a>
+  <div class="top-right">
+    <span id="dbx-pill" class="pill">Dropbox…</span>
+    <a class="link" href="/logout">Sign out</a>
+  </div>
+</header>
+
+<main id="home">
+  <section class="card new-edit">
+    <div class="card-head">
+      <h1>New edit</h1>
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-tab="dropbox" role="tab">Dropbox link</button>
+        <button class="tab" data-tab="upload" role="tab">Upload RAWs</button>
+      </div>
+    </div>
+
+    <div class="tab-body" data-body="dropbox">
+      <label for="link">Dropbox folder with the RAW brackets</label>
+      <input id="link" type="url" placeholder="https://www.dropbox.com/scl/fo/…" autocomplete="off">
+      <div class="row">
+        <div class="grow">
+          <label for="name">Property name <span class="muted">(optional)</span></label>
+          <input id="name" type="text" placeholder="e.g. 1214 Wilder St">
+        </div>
+        <div>
+          <label for="per-set">Brackets per photo</label>
+          <select id="per-set"><option value="0">Auto-detect</option><option value="3">3</option><option value="5">5</option><option value="7">7</option></select>
+        </div>
+      </div>
+      <label class="check"><input id="save-dbx" type="checkbox" checked> Save the edited photos to an <b>edited</b> folder next to the RAWs</label>
+      <div class="actions"><button id="start-dbx" class="btn primary">Start editing</button><span id="dbx-msg" class="msg"></span></div>
+    </div>
+
+    <div class="tab-body hidden" data-body="upload">
+      <div id="drop" class="drop">
+        <input id="files" type="file" multiple hidden>
+        <p><b>Drop RAW files here</b> or <button class="btn small" id="pick">choose files</button></p>
+        <p class="muted">All brackets for the property · RW2, CR3, CR2, NEF, ARW, DNG…</p>
+      </div>
+      <div class="row">
+        <div class="grow">
+          <label for="up-name">Property name</label>
+          <input id="up-name" type="text" placeholder="e.g. 1214 Wilder St">
+        </div>
+        <div>
+          <label for="up-per-set">Brackets per photo</label>
+          <select id="up-per-set"><option value="0">Auto-detect</option><option value="3">3</option><option value="5">5</option><option value="7">7</option></select>
+        </div>
+      </div>
+      <div id="up-progress" class="progress hidden"><div></div></div>
+      <div class="actions"><button id="start-up" class="btn primary" disabled>Upload &amp; edit</button><span id="up-msg" class="msg"></span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-title">Recent edits</h2>
+    <div id="jobs" class="jobs"><p class="muted">Loading…</p></div>
+  </section>
+</main>
+
+<main id="job" class="hidden">
+  <div class="job-head">
+    <a class="link" href="#/">← All edits</a>
+    <div class="job-title">
+      <h1 id="job-name"></h1>
+      <p id="job-status" class="muted"></p>
+    </div>
+    <div class="job-actions">
+      <button id="job-retry" class="btn hidden">Try again</button>
+      <a id="job-zip" class="btn primary hidden" href="#">Download all</a>
+      <button id="job-delete" class="btn ghost">Delete</button>
+    </div>
+  </div>
+  <div id="job-progress" class="progress"><div></div></div>
+  <p id="job-dest" class="muted"></p>
+  <div id="job-failed" class="notice hidden"></div>
+  <div id="gallery" class="gallery"></div>
+</main>
+
+<div id="viewer" class="viewer hidden" role="dialog" aria-modal="true">
+  <button class="viewer-close" aria-label="Close">×</button>
+  <div class="ba big-ba" id="viewer-ba"></div>
+  <p class="viewer-cap" id="viewer-cap"></p>
+</div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
