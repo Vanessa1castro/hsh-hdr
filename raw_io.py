@@ -11,7 +11,7 @@ import struct
 import cv2
 import numpy as np
 
-from . import rw2
+import rw2
 
 RAW_EXTS = {'.rw2', '.cr2', '.cr3', '.nef', '.nrw', '.arw', '.srf', '.sr2', '.raf',
             '.orf', '.dng', '.pef', '.rwl', '.3fr', '.iiq', '.erf', '.mef', '.mos', '.srw', '.x3f'}
@@ -102,6 +102,9 @@ def read_info(path):
         exif_ptr = t0.get(0x8769)
         ex = _tiff_tags(d, exif_ptr, endian) if isinstance(exif_ptr, int) else {}
         info['exposure'] = ex.get(0x829a) if isinstance(ex.get(0x829a), float) else None
+        iso = ex.get(0x8827)
+        if info['exposure'] and isinstance(iso, int) and iso > 0:
+            info['exposure'] = info['exposure'] * iso / 100.0  # brackets may vary ISO, not shutter
         info['focal'] = ex.get(0x920a) if isinstance(ex.get(0x920a), float) else None
         ts = ex.get(0x9003) or t0.get(0x132)
         if isinstance(ts, str):
@@ -147,11 +150,40 @@ def _load_libraw(path):
     return out.astype(np.float32) / 65535.0
 
 
+def _load_embedded_jpeg(path):
+    """Fallback for cameras the RAW decoder doesn't know yet: the camera's own
+    full-size JPEG preview inside the RAW file."""
+    import io
+    from PIL import Image
+    with open(path, 'rb') as fh:
+        d = fh.read()
+    best, i = None, 0
+    while True:
+        i = d.find(b'\xff\xd8\xff', i)
+        if i < 0:
+            break
+        try:
+            im = Image.open(io.BytesIO(d[i:i + 40_000_000]))
+            if best is None or im.size[0] > best.size[0]:
+                im.load()
+                best = im.convert('RGB')
+        except Exception:
+            pass
+        i += 3
+    if best is None or best.size[0] < 2000:
+        raise ValueError('This RAW format is not supported yet')
+    rgb = np.asarray(best).astype(np.float32) / 255.0
+    return np.power(rgb, 2.2) / 1.6  # undo display gamma; pipeline re-applies x1.6
+
+
 def load_linear(path):
     """Linear-light sRGB float32 image in [0, 1+], white balance applied."""
     if path.lower().endswith('.rw2') and _rw2_supported(path):
         return _load_rw2(path)
-    return _load_libraw(path)
+    try:
+        return _load_libraw(path)
+    except Exception:
+        return _load_embedded_jpeg(path)
 
 
 def quick_brightness(path):

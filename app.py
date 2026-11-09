@@ -5,13 +5,14 @@ import re
 import secrets
 import zipfile
 
-from flask import (Flask, abort, jsonify, redirect, render_template, request, send_file,
+from flask import (Flask, abort, jsonify, redirect, render_template_string, request, Response, send_file,
                    session, url_for)
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 from dropbox_client import Dropbox, DropboxError
-from engine import raw_io
+import raw_io
+from web_assets import CSS, JS, INDEX_HTML, LOGIN_HTML
 from jobs import STATUS_LABELS, JobStore, Worker
 
 DATA_DIR = os.environ.get('DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
@@ -29,7 +30,7 @@ def _secret_key():
     return open(p).read().strip()
 
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = _secret_key()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
@@ -45,7 +46,7 @@ worker.start()
 
 @app.before_request
 def _require_login():
-    if request.endpoint in ('login', 'static', 'health'):
+    if request.endpoint in ('login', 'static_css', 'health'):
         return None
     if not APP_PASSWORD:
         return ('Set the APP_PASSWORD variable in Railway to finish setup.', 503)
@@ -54,6 +55,16 @@ def _require_login():
             return jsonify(error='Please sign in again.'), 401
         return redirect(url_for('login', next=request.path))
     return None
+
+
+@app.route('/static/style.css')
+def static_css():
+    return Response(CSS, mimetype='text/css')
+
+
+@app.route('/static/app.js')
+def static_js():
+    return Response(JS, mimetype='application/javascript')
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -66,7 +77,7 @@ def login():
             nxt = request.args.get('next', '/')
             return redirect(nxt if nxt.startswith('/') and not nxt.startswith('//') else '/')
         error = 'That password is not right.'
-    return render_template('login.html', error=error)
+    return render_template_string(LOGIN_HTML, error=error)
 
 
 @app.route('/logout')
@@ -84,7 +95,7 @@ def health():
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template_string(INDEX_HTML)
 
 
 # -------------------------------------------------------------- dropbox --

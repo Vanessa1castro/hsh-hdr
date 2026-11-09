@@ -4,3 +4,4 @@ requests>=2.31,<3
 numpy>=1.26,<3
 opencv-python-headless>=4.9,<5
 rawpy>=0.22,<1
+pillow>=10,<13

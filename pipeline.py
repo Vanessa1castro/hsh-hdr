@@ -9,7 +9,7 @@ import os
 import cv2
 import numpy as np
 
-from . import raw_io
+import raw_io
 
 # ------------------------------------------------------------------ grouping --
 
@@ -42,7 +42,7 @@ def group_brackets(paths, per_set=0, gap_s=8.0, infos=None):
         repeated = any(abs(np.log(e_new / (o['exposure'] or 1))) < 0.18 for o in cur)
         # brackets run in one direction (bright->dark or dark->bright); a reversal starts a new set
         reversed_ = False
-        if len(cur) >= 2:
+        if len(cur) >= 2 and pause > 2:  # shots fired within 2 s belong together in any order
             d_prev = np.sign(np.log(e_last / (cur[-2]['exposure'] or 1)))
             reversed_ = np.sign(np.log(e_new / e_last)) != d_prev
         if pause > gap_s or repeated or reversed_ or len(cur) >= 9:
@@ -296,7 +296,7 @@ def _verticals(img, max_deg=12):
         return img, None
     S = np.array([[w / cw, 0, -x0 * w / cw], [0, h / ch, -y0 * h / ch], [0, 0, 1]])
     Mw = S @ H
-    out = cv2.warpPerspective(img, Mw, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+    out = cv2.warpPerspective(img, Mw, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     return np.clip(out, 0, 1), Mw
 
 
