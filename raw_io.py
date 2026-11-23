@@ -195,6 +195,9 @@ def quick_brightness(path):
             return float(v[::16, ::16].mean())
     except Exception:
         if path.lower().endswith('.rw2'):
-            raw, _ = rw2.decode(path)
-            return float(raw[::16, ::16].mean())
+            try:
+                raw, _ = rw2.decode(path)
+                return float(raw[::16, ::16].mean())
+            except Exception:
+                return 0.0
         return 0.0
