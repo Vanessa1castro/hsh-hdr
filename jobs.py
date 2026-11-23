@@ -115,6 +115,9 @@ class Worker(threading.Thread):
             except Exception as e:  # keep the worker alive whatever happens
                 traceback.print_exc()
                 job = self.store.get(job['id']) or job
+                if job.get('source') == 'dropbox':  # RAWs can be fetched again on retry
+                    shutil.rmtree(os.path.join(self.store.dir(job['id']), 'raw'), ignore_errors=True)
+                    os.makedirs(os.path.join(self.store.dir(job['id']), 'raw'), exist_ok=True)
                 job['status'] = 'error'
                 job['error'] = str(e)[:500]
                 self.store.save(job)
@@ -184,13 +187,17 @@ class Worker(threading.Thread):
                     self._set(job, 'downloading', f'Reading RAW info {i} of {len(files)}')
             if os.path.exists(head):
                 os.remove(head)
-            if any(v['exposure'] is None for v in infos.values()):
-                # no usable EXIF (e.g. some CR3 files): download everything up front instead
-                for i, (local, (rp, size)) in enumerate(remote.items(), 1):
-                    if not (os.path.exists(local) and os.path.getsize(local) == size):
-                        self.dbx.download_link_file(job['link'], rp, local)
-                    self._set(job, 'downloading', f'Downloaded {i} of {len(remote)} RAWs')
-                infos, remote = {}, {}
+            missing = [loc for loc, v in infos.items() if v['exposure'] is None]
+            for k, local in enumerate(missing, 1):
+                # camera info not in the first few MB (some cameras store it further in):
+                # read the whole file, take the info, and delete it again so the disk stays free
+                rp, size = remote[local]
+                self._set(job, 'downloading', f'Reading RAW info (full file) {k} of {len(missing)}')
+                self.dbx.download_link_file(job['link'], rp, local)
+                infos[local] = raw_io.read_info(local)
+                if infos[local]['exposure'] is None:  # no exposure tag at all: use the RAW's brightness
+                    infos[local]['exposure'] = raw_io.quick_brightness(local) or 1.0
+                os.remove(local)
             raws = sorted(set(infos) | set(remote) | {os.path.join(raw_dir, x) for x in os.listdir(raw_dir)
                                                       if raw_io.is_raw(x)})
             if job['save_to_dropbox'] and not job['dropbox_dest']:
