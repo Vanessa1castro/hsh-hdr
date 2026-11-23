@@ -335,6 +335,149 @@ def _finish(fused, model='', focal=None):
     return img, geometry
 
 
+
+# ------------------------------------------------------- window recovery --
+# Windows and open doors are blown out in the brightest bracket. Where the darkest
+# bracket still shows the view (foliage, sky, trees), that view is toned on its own
+# and placed back. White frames, sills, walls and patios keep the main edit.
+
+def _srgb_lin(x):
+    x = np.clip(x, 0, 1)
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4).astype(np.float32)
+
+
+def _window_regions(bright, dark_lin):
+    h, w = bright.shape[:2]
+    sc = 800 / w
+    b = cv2.resize(bright, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+    dl = cv2.resize(dark_lin.mean(2), (b.shape[1], b.shape[0]), interpolation=cv2.INTER_AREA)
+    rel = dl / max(float(np.median(dl)), 1e-5)
+    m = ((b > 0.93) & (rel > 3.0)).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    lg = np.log(np.maximum(dl, 1e-5))
+    tex = np.abs(lg - cv2.GaussianBlur(lg, (0, 0), 2))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m)
+    keep = np.zeros_like(m)
+    for i in range(1, n):
+        comp = lab == i
+        # skip small highlights (lamps) and smooth sunlit plaster (ceilings, walls)
+        if st[i, cv2.CC_STAT_AREA] >= b.size * 0.003 and float(np.median(tex[comp])) > 0.05:
+            keep[comp] = 1
+    return keep
+
+
+def _window_pixels(bright, dark_lin, keep):
+    h, w = bright.shape[:2]
+    reg = cv2.resize(cv2.dilate(keep, np.ones((5, 5), np.uint8)).astype(np.float32), (w, h),
+                     interpolation=cv2.INTER_LINEAR)
+    blown = np.clip((bright - 0.90) / 0.07, 0, 1)
+    dl = np.log(np.maximum(dark_lin.mean(2), 1e-5))
+    sig = w / 1000.0
+    tex = cv2.GaussianBlur(np.abs(dl - cv2.GaussianBlur(dl, (0, 0), 2 * sig)), (0, 0), 4 * sig)
+    del dl
+    m = reg * blown * np.clip((tex - 0.02) / 0.04, 0, 1)
+    return np.clip(cv2.GaussianBlur(m, (0, 0), 1.2 * sig) * 1.3, 0, 1)
+
+
+def _window_view(dark_lin, keep, hi=0.78, lc=0.22, sat=1.45):
+    s = cv2.resize(dark_lin, (keep.shape[1], keep.shape[0]), interpolation=cv2.INTER_AREA)
+    Y = s.mean(2)[keep > 0]
+    p = float(np.percentile(Y, 92)) if Y.size else 0.1
+    x = dark_lin * (hi / max(p, 1e-5))
+    Yx = np.maximum(x.mean(2), 1e-6)
+    Yt = Yx * (1 + Yx / 1.6 ** 2) / (1 + Yx) * 1.35
+    x = x * (np.minimum(Yt, 1.0) / Yx)[..., None]
+    del Yx, Yt
+    out = np.clip(_srgb_gamma(np.clip(x, 0, 1)), 0, 1).astype(np.float32)
+    del x
+    Yo = out.mean(2)
+    base = cv2.GaussianBlur(Yo, (0, 0), out.shape[1] * 0.006)
+    out = np.clip(out + (lc * (Yo - base))[..., None], 0, 1)
+    lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB)
+    # foliage: richer, deeper natural green (yellow-green pushed toward leaf green)
+    hue = np.degrees(np.arctan2(lab[..., 2], lab[..., 1]))
+    g = np.clip(1 - np.abs(hue - 120) / 45, 0, 1)
+    lab[..., 1:] *= (1 + (sat - 1) * (0.5 + 0.5 * g))[..., None]
+    lab[..., 0] -= 4 * g * np.clip((lab[..., 0] - 30) / 30, 0, 1)
+    lab[..., 2] -= 3 * g
+    return np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+
+
+def _window_openings(keep, dark_lin, full_shape):
+    """The whole opening around each blown window: inside its bounding box, every
+    pixel lit by daylight (clearly brighter than the room in the darkest bracket)."""
+    sc_h, sc_w = keep.shape
+    dl = cv2.resize(dark_lin.mean(2), (sc_w, sc_h), interpolation=cv2.INTER_AREA)
+    rel = dl / max(float(np.median(dl)), 1e-5)
+    out = np.zeros(keep.shape, np.float32)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(keep)
+    for i in range(1, n):
+        x, y, w, h = st[i, :4]
+        p = max(2, int(0.04 * max(w, h)))
+        y0, y1, x0, x1 = max(0, y - p), min(sc_h, y + h + p), max(0, x - p), min(sc_w, x + w + p)
+        out[y0:y1, x0:x1] = np.maximum(out[y0:y1, x0:x1], np.clip((rel[y0:y1, x0:x1] - 1.6) / 0.8, 0, 1))
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    H, W = full_shape
+    reg = cv2.resize(out, (W, H), interpolation=cv2.INTER_LINEAR)
+    return np.clip(cv2.GaussianBlur(reg, (0, 0), W / 1000.0 * 2), 0, 1)
+
+
+def _recover_windows(img, geometry, bright, dark_lin):
+    keep = _window_regions(bright, dark_lin)
+    if keep.sum() == 0:
+        return img
+    reg = np.clip(geometry(_window_openings(keep, dark_lin, bright.shape)), 0, 1)
+    win = geometry(_window_view(dark_lin, keep))
+    sig = img.shape[1] / 1000.0
+    labw = cv2.cvtColor(win, cv2.COLOR_RGB2LAB)
+    Lw = labw[..., 0]
+    Cw = np.hypot(labw[..., 1], labw[..., 2])
+    hue = np.degrees(np.arctan2(labw[..., 2], labw[..., 1]))
+    del labw
+    lg = Lw / 100.0
+    tex = cv2.GaussianBlur(np.abs(lg - cv2.GaussianBlur(lg, (0, 0), 2 * sig)), (0, 0), 3 * sig)
+    # the view = leaf greens, bright sky, or strongly coloured things; anything near-neutral
+    # (white frames and doors in shade, patios, thresholds, walls) keeps the main edit
+    green = np.clip(1 - np.abs(hue - 125) / 45, 0, 1)
+    sky = np.clip(1 - np.abs(hue + 95) / 35, 0, 1) * np.clip((Lw - 70) / 8, 0, 1)
+    colour = np.maximum(np.maximum(green, sky) * np.clip((Cw - 8) / 4, 0, 1), np.clip((Cw - 16) / 5, 0, 1))
+    dark = np.clip((42 - Lw) / 10, 0, 1) * np.clip((tex - 0.02) / 0.03, 0, 1) * green * np.clip((Cw - 2) / 3, 0, 1)
+    view = np.clip(cv2.GaussianBlur(np.maximum(colour, dark), (0, 0), 1.5 * sig) * 1.5, 0, 1)
+    del hue, tex, green, sky, colour, dark, Cw
+    Lf = cv2.cvtColor(np.clip(img, 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)[..., 0]
+    m = reg * view * np.clip((Lf - Lw + 3) / 8, 0, 1)
+    del Lf, Lw, view, reg
+    return np.clip(img * (1 - m[..., None]) + win * m[..., None], 0, 1)
+
+
+def _wood(img, chroma=1.08, dl=9.0, lift=24.0, strip=512):
+    """Natural oak: light boards a touch richer (not pale), honey-oak doors opened up.
+    Worked out on a smoothed copy so whole surfaces shift evenly and grain is kept;
+    dark low-colour woods (walnut vanities) are left as they are."""
+    h, w = img.shape[:2]
+    sm = cv2.resize(np.clip(img, 0, 1).astype(np.float32), (w // 4, h // 4), interpolation=cv2.INTER_AREA)
+    sm = cv2.GaussianBlur(sm, (0, 0), 2)
+    lab = cv2.cvtColor(sm, cv2.COLOR_RGB2LAB)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    C = np.hypot(a, b)
+    hue = np.degrees(np.arctan2(b, a))
+    m = np.clip(1 - np.abs(hue - 72) / 22, 0, 1) * np.clip((C - 10) / 6, 0, 1) * np.clip((L - 15) / 10, 0, 1)
+    dL = -dl * np.clip((L - 62) / 14, 0, 1) + lift * np.clip((52 - L) / 22, 0, 1) * np.clip((C - 15) / 4, 0, 1)
+    dL = cv2.GaussianBlur(m * dL, (0, 0), 3)
+    fc = cv2.GaussianBlur(1 + (chroma - 1) * m, (0, 0), 3)
+    dL = cv2.resize(dL, (w, h), interpolation=cv2.INTER_LINEAR)
+    fc = cv2.resize(fc, (w, h), interpolation=cv2.INTER_LINEAR)
+    del sm, lab, L, a, b, C, hue, m
+    out = np.empty_like(img, dtype=np.float32)
+    for y0 in range(0, h, strip):
+        lab = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        lab[..., 0] = np.clip(lab[..., 0] + dL[y0:y0 + strip], 0, 100)
+        lab[..., 1] *= fc[y0:y0 + strip]
+        lab[..., 2] *= fc[y0:y0 + strip]
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    return out
+
+
 # ------------------------------------------------------------------ public --
 
 def process_set(bracket_set, preview_width=1200):
@@ -354,8 +497,11 @@ def process_set(bracket_set, preview_width=1200):
     w = min(f.shape[1] for f in frames)
     frames = [f[:h, :w] for f in frames]
     mid = frames[len(frames) // 2].copy()
+    bright = dark_lin = None
     if len(frames) > 1:
         frames = _align(frames)
+        bright = frames[0].max(2)
+        dark_lin = _srgb_lin(frames[-1]) / 1.6
         fused = _fuse(frames)
     else:
         fused = frames[0]
@@ -365,6 +511,14 @@ def process_set(bracket_set, preview_width=1200):
     img, geometry = _finish(fused, first.get('model', ''), first.get('focal'))
     del fused
     gc.collect()
+    if bright is not None:
+        try:
+            img = _recover_windows(img, geometry, bright, dark_lin)
+        except Exception:  # never lose a photo over the window step
+            pass
+        del bright, dark_lin
+        gc.collect()
+    img = _wood(img)
     before = cv2.resize(geometry(mid), (preview_width, int(preview_width * h / w)), interpolation=cv2.INTER_AREA)
     del mid
     out = (img * 255 + 0.5).astype(np.uint8)
