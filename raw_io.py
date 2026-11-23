@@ -86,7 +86,7 @@ def read_info(path):
     info = {'exposure': None, 'time': None, 'focal': None, 'model': '', 'make': ''}
     try:
         with open(path, 'rb') as fh:
-            d = fh.read(4 * 1024 * 1024)  # EXIF lives near the start of TIFF-based raws
+            d = fh.read(96 * 1024 * 1024)  # EXIF usually sits near the start; some cameras put it further in
         if d[:4] == b'IIU\x00':  # Panasonic RW2
             endian = '<'
         elif d[:2] == b'II':

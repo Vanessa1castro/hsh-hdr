@@ -134,6 +134,33 @@ class Worker(threading.Thread):
         job['message'] = message
         self.store.save(job)
 
+    def _save_photo(self, job, photo, d):
+        """Upload one finished photo to Dropbox, then free the disk: the site keeps only its
+        small previews. If Dropbox refuses (e.g. no write permission), stop trying for this
+        job and keep the photos on the site instead, so nothing is lost."""
+        if not (job['save_to_dropbox'] and job['dropbox_dest']) or job.get('save_error') or photo.get('in_dropbox'):
+            return
+        local = os.path.join(d, 'out', photo['name'] + '.jpg')
+        if not os.path.exists(local):
+            return
+        try:
+            self.dbx.upload(local, f"{job['dropbox_dest']}/{photo['name']}.jpg")
+        except Exception as e:
+            traceback.print_exc()
+            job['save_error'] = str(e)[:300]
+            self.store.save(job)
+            return
+        photo['in_dropbox'] = True
+        job['saved_count'] = sum(1 for p in job['photos'] if p.get('in_dropbox'))
+        try:
+            os.remove(local)
+        except OSError:
+            pass
+        zp = os.path.join(d, 'photos.zip')
+        if os.path.exists(zp):
+            os.remove(zp)
+        self.store.save(job)
+
     def process(self, job):
         d = self.store.dir(job['id'])
         raw_dir = os.path.join(d, 'raw')
@@ -209,8 +236,10 @@ class Worker(threading.Thread):
                 cv2.imwrite(os.path.join(d, 'preview', name + '_after.jpg'),
                             cv2.cvtColor(after, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
                 del out, before, after
-                job['photos'].append({'name': name, 'frames': [os.path.basename(x['path']).split('__')[-1] for x in s],
-                                      'seconds': round(time.time() - t0)})
+                photo = {'name': name, 'frames': [os.path.basename(x['path']).split('__')[-1] for x in s],
+                         'seconds': round(time.time() - t0)}
+                job['photos'].append(photo)
+                self._save_photo(job, photo, d)
             except Exception as e:
                 traceback.print_exc()
                 job['failed'].append({'name': name, 'error': str(e)[:300]})
@@ -223,19 +252,17 @@ class Worker(threading.Thread):
             self.store.save(job)
             gc.collect()
 
-        # 4. save to Dropbox
-        if job['save_to_dropbox'] and job['dropbox_dest']:
-            names = [p['name'] for p in job['photos']]
-            for k, n in enumerate(names, 1):
-                self._set(job, 'saving', f'Saving {k} of {len(names)} to Dropbox')
-                self.dbx.upload(os.path.join(d, 'out', n + '.jpg'), f"{job['dropbox_dest']}/{n}.jpg")
-                job['saved_count'] = k
-            self.store.save(job)
+        # 4. anything edited but not yet in Dropbox (e.g. after a restart) gets one more try
+        for photo in job['photos']:
+            self._save_photo(job, photo, d)
+        self.store.save(job)
 
         # 5. tidy up: RAWs are no longer needed
         shutil.rmtree(raw_dir, ignore_errors=True)
         os.makedirs(raw_dir, exist_ok=True)
         msg = f"{len(job['photos'])} photos ready"
+        if job['save_to_dropbox'] and job['dropbox_dest'] and not job.get('save_error'):
+            msg += ' · saved to Dropbox'
         if job['failed']:
             msg += f", {len(job['failed'])} could not be edited"
         self._set(job, 'done', msg)

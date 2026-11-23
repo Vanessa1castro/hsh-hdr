@@ -140,6 +140,8 @@ def _public(job, full=False):
                              'save_to_dropbox')}
     j['status_label'] = STATUS_LABELS.get(job['status'], job['status'])
     j['photo_count'] = len(job['photos'])
+    j['save_error'] = job.get('save_error', '')
+    j['local_count'] = sum(1 for p in job['photos'] if not p.get('in_dropbox'))
     j['failed'] = job['failed']
     if full:
         j['photos'] = job['photos']
@@ -219,9 +221,10 @@ def api_job(jid):
 @app.route('/api/jobs/<jid>/retry', methods=['POST'])
 def api_retry(jid):
     job = store.get(jid)
-    if not job or job['status'] != 'error':
+    if not job or not (job['status'] == 'error' or (job['status'] == 'done' and job.get('save_error'))):
         abort(404)
     job['status'], job['error'], job['message'] = 'queued', '', 'Retrying'
+    job['save_error'] = ''  # try saving to Dropbox again too (e.g. after fixing permissions)
     store.save(job)
     worker.wake.set()
     return jsonify(_public(job))
@@ -261,7 +264,9 @@ def job_zip(jid):
         abort(404)
     d = store.dir(jid)
     zp = os.path.join(d, 'photos.zip')
-    names = [p['name'] for p in job['photos']]
+    names = [p['name'] for p in job['photos'] if os.path.exists(os.path.join(d, 'out', p['name'] + '.jpg'))]
+    if not names:
+        abort(404)
     if not os.path.exists(zp) or os.path.getmtime(zp) < job['updated']:
         with zipfile.ZipFile(zp + '.tmp', 'w', zipfile.ZIP_STORED) as z:
             for n in names:
