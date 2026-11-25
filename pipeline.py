@@ -135,6 +135,178 @@ def _fuse(frames, n=9):
     return np.clip(out, 0, 1)
 
 
+
+def _deblotch(fused, frames, sigma_frac=0.035, verbose=False):
+    """Make large-scale brightness and colour follow the true scene light (a radiance
+    merge of all brackets); the exposure fusion keeps only texture and local detail."""
+    h, w = fused.shape[:2]
+    sw = 800; sh = int(round(sw * h / w))
+    sm = [cv2.resize(f, (sw, sh), interpolation=cv2.INTER_AREA) for f in frames]
+    lin = [_srgb_lin(f) for f in sm]
+    vmax = [f.max(2) for f in sm]
+    # relative exposure between consecutive brackets, measured from the pixels themselves
+    scale = [1.0]
+    for k in range(len(sm) - 1):
+        a, b = lin[k].mean(2), lin[k + 1].mean(2)
+        m = (vmax[k] < 0.9) & (vmax[k] > 0.08) & (vmax[k + 1] > 0.04) & (vmax[k + 1] < 0.9)
+        r = float(np.median(a[m] / np.maximum(b[m], 1e-5))) if m.sum() > 200 else 3.0
+        scale.append(scale[-1] * max(r, 1.0))
+    num = np.zeros_like(lin[0]); den = np.zeros((sh, sw, 1), np.float32)
+    for k, (L, v) in enumerate(zip(lin, vmax)):
+        wgt = np.exp(-((v - 0.5) ** 2) / (2 * 0.22 ** 2))
+        if k < len(lin) - 1:
+            wgt = wgt * (v < 0.95)
+        wgt = np.maximum(wgt, 1e-4 if k == len(lin) - 1 else 0)[..., None]
+        num += wgt * L * scale[k]; den += wgt
+    R = num / np.maximum(den, 1e-6)
+    Lr = np.maximum(R.mean(2), 1e-6)
+    fs = cv2.resize(fused, (sw, sh), interpolation=cv2.INTER_AREA)
+    Lf = np.maximum(fs.mean(2), 1e-4)
+    # one global, smooth, increasing curve: true light level -> the fusion's typical brightness
+    lr = np.log(Lr).ravel(); lf = Lf.ravel()
+    qs = np.quantile(lr, np.linspace(0, 1, 41))
+    cx, cy = [], []
+    for a, b in zip(qs[:-1], qs[1:]):
+        m = (lr >= a) & (lr <= b)
+        if m.sum() > 20:
+            cx.append(float(np.median(lr[m]))); cy.append(float(np.median(lf[m])))
+    cy = np.maximum.accumulate(np.array(cy))
+    G = np.interp(np.log(Lr), cx, cy).astype(np.float32)
+    G = np.maximum(G, 1e-4)
+    sig = sigma_frac * sw
+    # windows / lamps keep the fusion's own (recovered) rendering
+    keep = np.clip((Lf - 0.72) / 0.12, 0, 1)
+    # mainly lift areas the fusion left too dark (shadow patches, halos); only darken very little,
+    # so light floors and bright rooms keep their airy look
+    raw_c = np.clip(np.log(G) - np.log(Lf), -0.8, 0.8)
+    # truly dark things (black fixtures, dark wood, deep corners) are not lifted: lifting them
+    # would raise the black point and make the whole photo duller
+    # smooth the correction using only room pixels (no dark ring around windows)
+    corr = cv2.GaussianBlur(raw_c * (1 - keep), (0, 0), sig) / np.maximum(cv2.GaussianBlur(1 - keep, (0, 0), sig), 1e-3)
+    corr = corr * (1 - cv2.GaussianBlur(keep, (0, 0), 1.5))
+    # edge-aware fine pass: removes the narrow dark/bright halos the fusion leaves along
+    # door frames and window edges, while keeping real edges (guided by the true light map)
+    fine = _gf(np.log(G).astype(np.float32), ((raw_c - corr) * (1 - keep)).astype(np.float32), 5, 0.01)
+    corr = corr + fine * (1 - cv2.GaussianBlur(keep, (0, 0), 1.5))
+    # colour: walls and ceilings lit by mixed daylight / bulbs get blue and orange zones.
+    # Pull the large-scale tint of near-neutral surfaces back to neutral; real colours stay.
+    lb = cv2.cvtColor(np.clip(fs * np.exp(corr)[..., None], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+    ab_lo = cv2.GaussianBlur(lb[..., 1:], (0, 0), sig)
+    C_lo = np.hypot(ab_lo[..., 0], ab_lo[..., 1])
+    ref = np.median(ab_lo[(C_lo < 12) & (lb[..., 0] > 50)], axis=0) if ((C_lo < 12) & (lb[..., 0] > 50)).sum() > 100 else np.zeros(2)
+    # near-neutral surfaces; bright painted surfaces (white doors / walls lit warm or cool) count up to higher colour
+    cmax = 16 + 8 * np.clip((lb[..., 0] - 70) / 10, 0, 1)
+    neutral = np.clip((cmax - C_lo) / 8, 0, 1) * np.clip((lb[..., 0] - 35) / 15, 0, 1) * (1 - keep)
+    dab = -cv2.GaussianBlur((ab_lo - ref) * 0.8 * neutral[..., None], (0, 0), sig)
+    # window views: outdoor shade reads blue next to warm room light; take most of the blue out
+    win_soft = cv2.GaussianBlur(keep, (0, 0), 2)
+    blue_shift = np.minimum(cv2.GaussianBlur(lb[..., 2], (0, 0), 4) - ref[1], 0)
+    dab[..., 1] -= 0.65 * blue_shift * win_soft
+    if verbose:
+        print('scales', [round(s, 2) for s in scale], 'corr range', float(corr.min()), float(corr.max()))
+    # second, sharper pass at higher resolution for the thin halos along door frames and windows:
+    # wherever the fusion is darker/brighter than the true light right next to an edge, follow
+    # the true light (edge-aware, so real edges and texture stay)
+    mw = 2000; mh = int(round(mw * h / w))
+    corr_m = cv2.resize(corr, (mw, mh), interpolation=cv2.INTER_CUBIC)
+    smm = [cv2.resize(f, (mw, mh), interpolation=cv2.INTER_AREA) for f in frames]
+    num = 0; den = 0
+    for k, f in enumerate(smm):
+        v = f.max(2)
+        wgt = np.exp(-((v - 0.5) ** 2) / (2 * 0.22 ** 2))
+        if k < len(smm) - 1:
+            wgt = wgt * np.clip((0.95 - v) / 0.04, 0, 1)
+        wgt = np.maximum(wgt, 1e-4 if k == len(smm) - 1 else 0)
+        num = num + wgt * _srgb_lin(f).mean(2) * scale[k]; den = den + wgt
+    del smm
+    Lr_m = np.maximum(num / np.maximum(den, 1e-6), 1e-6)
+    G_m = np.maximum(np.interp(np.log(Lr_m), cx, cy).astype(np.float32), 1e-4)
+    Lf_m = np.maximum(cv2.resize(fused, (mw, mh), interpolation=cv2.INTER_AREA).mean(2), 1e-4)
+    keep_m = cv2.resize(keep, (mw, mh), interpolation=cv2.INTER_LINEAR)
+    res = np.clip(np.log(G_m) - np.log(Lf_m) - corr_m, -0.35, 0.35) * (1 - keep_m)
+    lg = np.log(G_m).astype(np.float32)
+    # edge zone: within a few pixels of a strong brightness edge in the true light map
+    gx = cv2.Sobel(lg, cv2.CV_32F, 1, 0); gy = cv2.Sobel(lg, cv2.CV_32F, 0, 1)
+    zone = cv2.GaussianBlur(cv2.dilate((np.hypot(gx, gy) > 0.6).astype(np.float32), np.ones((25, 25), np.uint8)), (0, 0), 6)
+    fine2 = _gf(lg, (res * zone).astype(np.float32), 8, 0.02) * zone
+    corr = cv2.resize(corr_m + fine2, (w, h), interpolation=cv2.INTER_CUBIC)
+    del Lr_m, G_m, Lf_m, res, lg, gx, gy, zone, fine2, corr_m
+    dab = cv2.resize(dab, (w, h), interpolation=cv2.INTER_CUBIC)
+    out = np.empty_like(fused)
+    for y0 in range(0, h, 512):
+        f = np.clip(fused[y0:y0 + 512] * np.exp(corr[y0:y0 + 512])[..., None], 0, 1).astype(np.float32)
+        lab = cv2.cvtColor(f, cv2.COLOR_RGB2LAB)
+        lab[..., 1:] += dab[y0:y0 + 512]
+        out[y0:y0 + 512] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    # keep the black point where the fusion had it: the later tone step sets contrast from the
+    # darkest pixels, and lifting them would flatten the whole photo
+    pf = float(np.percentile(fs.mean(2), 0.2))
+    pd = float(np.percentile(cv2.resize(out, (sw, sh), interpolation=cv2.INTER_AREA).mean(2), 0.2))
+    if pd > pf:
+        for y0 in range(0, h, 512):
+            Y = out[y0:y0 + 512].mean(2, keepdims=True)
+            out[y0:y0 + 512] = np.clip(out[y0:y0 + 512] - (pd - pf) * np.clip(1 - Y / 0.5, 0, 1), 0, 1)
+    return out
+
+
+
+def _blend_render(frames, scales_from=None):
+    """How an editor blends brackets: start from the brightest photo and, only where it is
+    blown out, take the same spot from the next darker photo (scaled to the same exposure).
+    Masks follow the blown areas with soft edges, so there are no halos and no dark-bracket
+    noise or colour on walls and floors. Returns linear light."""
+    frames = sorted(frames, key=lambda f: -float(f.mean()))
+    h, w = frames[0].shape[:2]
+    sw = 800; sh = int(round(sw * h / w))
+    sm = [cv2.resize(f, (sw, sh), interpolation=cv2.INTER_AREA) for f in frames]
+    lin_s = [_srgb_lin(f) for f in sm]
+    scale = [1.0]
+    for k in range(len(sm) - 1):
+        va, vb = sm[k].max(2), sm[k + 1].max(2)
+        m = (va < 0.9) & (va > 0.15) & (vb > 0.04)
+        r = float(np.median(lin_s[k].mean(2)[m] / np.maximum(lin_s[k + 1].mean(2)[m], 1e-5))) if m.sum() > 200 else 3.0
+        scale.append(scale[-1] * max(r, 1.0))
+    sig = w / 600.0
+    ker = np.ones((int(sig * 3) | 1, int(sig * 3) | 1), np.uint8)
+    out = _srgb_lin(frames[0])
+    clipped = frames[0].max(2)
+    for k in range(1, len(frames)):
+        # soft luminosity mask (like an editor's): wide, gradual hand-off, so big bright walls
+        # don't get patches where one photo meets the next
+        cs = cv2.resize(clipped.astype(np.float32), (w // 4, h // 4), interpolation=cv2.INTER_AREA)
+        mx = cv2.dilate(cs, np.ones((5, 5), np.uint8))
+        ms = np.clip((cv2.GaussianBlur(mx, (0, 0), w / 4 / 120) - 0.70) / 0.22, 0, 1)
+        m = cv2.resize(ms, (w, h), interpolation=cv2.INTER_LINEAR)
+        m = np.maximum(m, np.clip((clipped - 0.88) / 0.06, 0, 1))
+        del cs, mx, ms
+        nxt = _srgb_lin(frames[k]) * scale[k]
+        out = out * (1 - m[..., None]) + nxt * m[..., None]
+        # what is still blown after this step: blown in this darker frame too
+        clipped = np.where(m > 0.5, frames[k].max(2), np.minimum(clipped, 0.5))
+        del nxt
+    return out, scale
+
+def _to_display(lin, fused_like_median=0.36):
+    """Global exposure + highlight shoulder -> display (sRGB-like) values. The shoulder is
+    set from the brightest real surfaces (bright doors, lit hallways), so they roll off
+    gently and keep their detail instead of clipping to flat white."""
+    s = cv2.resize(lin, None, fx=0.1, fy=0.1, interpolation=cv2.INTER_AREA).mean(2)
+    med = float(np.median(s))
+    k = (fused_like_median ** 2.2) / max(med, 1e-6)
+    W = float(np.clip(np.percentile(s * k, 99.8) * 1.15, 1.2, 12.0))
+    gain = 1 + 1 / W  # keeps mid-tones where they were
+    out = np.empty_like(lin)
+    for y0 in range(0, lin.shape[0], 512):
+        x = lin[y0:y0 + 512] * k
+        Y = np.maximum(x.mean(2), 1e-7)
+        Yt = Y * (1 + Y / (W * W)) / (1 + Y) * gain
+        # soft knee above 0.85 instead of a hard clip at 1.0
+        Yt = np.where(Yt > 0.85, 0.85 + 0.15 * (1 - np.exp(-(Yt - 0.85) / 0.15)), Yt)
+        x = x * (Yt / Y)[..., None]
+        out[y0:y0 + 512] = np.clip(_srgb_gamma(np.clip(x, 0, 1)), 0, 1)
+    return out.astype(np.float32)
+
+
 # ------------------------------------------------------------------ finish --
 
 def _gf(I, p, r, eps):
@@ -222,13 +394,56 @@ def _color(img, chroma_k=0.88):
     return np.clip(out * (1 - 0.7 * w) + neutral * (0.7 * w), 0, 1)
 
 
-def _sharpen(img, amt=0.45, sigma=1.0, lc=0.06):
+def _clean(img, strip=512):
+    """Smooth walls and ceilings: remove fine grain (noise from the dark brackets) where the
+    surface is flat; real edges, wood grain and texture are kept."""
+    h, w = img.shape[:2]
+    sc = w / 6000.0
+    out = np.empty_like(img)
+    pad = 16
+    for y0 in range(0, h, strip):
+        a, b = max(0, y0 - pad), min(h, y0 + strip + pad)
+        blk = img[a:b]
+        Y = blk.mean(2)
+        base = cv2.bilateralFilter(Y.astype(np.float32), int(max(5, 9 * sc)) | 1, 0.03, 4 * sc + 1)
+        d = Y - base
+        # soft coring: small wiggles (grain) are removed, larger detail stays
+        d2 = np.sign(d) * np.maximum(np.abs(d) - 0.006, 0) * np.clip(np.abs(d) / 0.02, 0, 1)
+        # walls and ceilings only; floors and furniture keep their full grain
+        res = np.clip(blk + ((d2 - d) * np.clip((base - 0.55) / 0.15, 0, 1))[..., None], 0, 1)
+        out[y0:y0 + strip] = res[y0 - a:y0 - a + min(strip, h - y0)]
+    return out
+
+
+def _brighten(img, lo=76.0, target=78.0):
+    """Rooms that come out darker than the HSH look (median below ~76 L*) get a gentle lift."""
+    s = cv2.resize(np.clip(img, 0, 1), None, fx=0.1, fy=0.1, interpolation=cv2.INTER_AREA).astype(np.float32)
+    med = float(np.median(cv2.cvtColor(s, cv2.COLOR_RGB2LAB)[..., 0]))
+    if med >= lo:
+        return img
+    m = med / 100.0
+    t = target / 100.0
+    g = float(np.clip(np.log(t ** 2.4) / np.log(max(m ** 2.4, 1e-4)), 0.75, 1.0))  # gamma in linear-ish space
+    Y = np.maximum(img.mean(2), 1e-5)
+    Yn = np.power(Y, g)
+    return np.clip(img * (Yn / Y)[..., None], 0, 1)
+
+
+def _sharpen(img, amt=0.40, sigma=1.0, lc=0.0):
     Y = img.mean(2)
     fine = Y - cv2.GaussianBlur(Y, (0, 0), sigma)
+    # sharpen real edges; leave flat walls/ceilings smooth
+    gx = cv2.Sobel(cv2.GaussianBlur(Y, (0, 0), 1.2), cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(cv2.GaussianBlur(Y, (0, 0), 1.2), cv2.CV_32F, 0, 1)
+    gm = np.hypot(gx, gy)
+    # sharpen texture and soft edges; very strong edges (door frames against bright rooms) get
+    # little, so they don't grow dark outlines
+    edge = np.clip((gm - 0.03) / 0.08, 0, 1) * np.clip((0.9 - gm) / 0.5, 0.15, 1)
+    del gx, gy
     h, w = Y.shape
     ys = cv2.resize(Y, (w // 4, h // 4), interpolation=cv2.INTER_AREA)
     base = cv2.resize(cv2.GaussianBlur(ys, (0, 0), w / 4 * 0.01), (w, h))
-    return np.clip(img + (amt * fine + lc * (Y - base))[..., None], 0, 1)
+    return np.clip(img + (amt * fine * edge + lc * (Y - base))[..., None], 0, 1)
 
 
 def _verticals(img, max_deg=12):
@@ -323,6 +538,8 @@ def _finish(fused, model='', focal=None):
     img = _tone(img)
     img = _white_balance(img)
     img = _color(img)
+    img = _brighten(img)
+    img = _clean(img)
     img = _sharpen(img)
     img, Mw = _verticals(img)
 
@@ -400,6 +617,11 @@ def _window_view(dark_lin, keep, hi=0.78, lc=0.22, sat=1.45):
     lab[..., 1:] *= (1 + (sat - 1) * (0.5 + 0.5 * g))[..., None]
     lab[..., 0] -= 4 * g * np.clip((lab[..., 0] - 30) / 30, 0, 1)
     lab[..., 2] -= 3 * g
+    # shade outdoors reads blue next to warm room light: white fences / walls back to white,
+    # skies keep a soft blue
+    bl = lab[..., 2] < 0
+    lab[..., 2] = np.where(bl, lab[..., 2] * 0.45, lab[..., 2])
+    lab[..., 1] = np.where(bl, lab[..., 1] * 0.6, lab[..., 1])
     return np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
 
 
@@ -450,7 +672,269 @@ def _recover_windows(img, geometry, bright, dark_lin):
     return np.clip(img * (1 - m[..., None]) + win * m[..., None], 0, 1)
 
 
-def _wood(img, chroma=1.08, dl=9.0, lift=24.0, strip=512):
+def _window_tint(img, geometry, bright, strip=512):
+    """Window panes (blown in the brightest bracket): no blue/purple cast on the view.
+    Shade outside reads blue-violet next to warm room light; real greens and soft sky stay."""
+    m = cv2.GaussianBlur(np.clip((bright - 0.92) / 0.06, 0, 1).astype(np.float32), (0, 0), 3)
+    m = np.clip(geometry(m), 0, 1)
+    out = img.copy()
+    for y0 in range(0, img.shape[0], strip):
+        mm = m[y0:y0 + strip]
+        if mm.max() < 0.02:
+            continue
+        lab = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        a, b = lab[..., 1], lab[..., 2]
+        cool = b < 0
+        nb = np.where(cool, b * 0.4, b)
+        na = np.where(cool & (a > 0), a * 0.2, a)  # violet -> neutral
+        Cw = np.hypot(a, b)
+        na = np.where((a < 0) & (b < 4) & (Cw < 22), na * 0.35, na)  # cyan -> neutral (greens keep b > 0)
+        lab[..., 1] = a + (na - a) * mm
+        lab[..., 2] = b + (nb - b) * mm
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    return out
+
+
+def _deflare(img, strip=512):
+    """Remove soft lens-flare spots (ghost reflections of bright windows) from plain walls and
+    ceilings: small, round, soft, slightly brighter blobs on an otherwise flat surface."""
+    h, w = img.shape[:2]
+    sw = 600
+    sh = int(round(sw * h / w))
+    s = cv2.resize(np.clip(img, 0, 1), (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32)
+    lab = cv2.cvtColor(s, cv2.COLOR_RGB2LAB)
+    L = lab[..., 0]
+    bg = cv2.medianBlur(np.clip(L * 2.55, 0, 255).astype(np.uint8), 31).astype(np.float32) / 2.55
+    res = cv2.GaussianBlur(L, (0, 0), 2) - bg
+    tex = cv2.GaussianBlur(np.abs(L - cv2.GaussianBlur(L, (0, 0), 1.5)), (0, 0), 4)
+    gx = cv2.Sobel(cv2.GaussianBlur(L, (0, 0), 2), cv2.CV_32F, 1, 0); gy = cv2.Sobel(cv2.GaussianBlur(L, (0, 0), 2), cv2.CV_32F, 0, 1)
+    edges = cv2.dilate((np.hypot(gx, gy) > 12).astype(np.uint8), np.ones((5, 5), np.uint8))
+    cand = ((res > 1.5) & (res < 14) & (bg > 60) & (tex < 1.2)).astype(np.uint8)
+    n, lbl, st, cen = cv2.connectedComponentsWithStats(cand)
+    mask = np.zeros((sh, sw), np.float32)
+    for i in range(1, n):
+        x, y, bw, bh, area = st[i]
+        if not (25 <= area <= 0.004 * sw * sh) or not (0.5 < bw / max(bh, 1) < 2.0) or area < 0.55 * bw * bh * 0.785:
+            continue
+        comp = lbl == i
+        if edges[comp].mean() > 0.15:  # sits on real edges (outlet, frame) -> not a flare
+            continue
+        mask[comp] = 1
+    if mask.max() == 0:
+        return img
+    mask = cv2.GaussianBlur(cv2.dilate(mask, np.ones((5, 5), np.uint8)), (0, 0), 3)
+    dl = cv2.resize(-(res * mask), (w, h), interpolation=cv2.INTER_CUBIC)
+    m = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+    # also pull the spot's tint back to the surrounding wall colour
+    ab_bg = cv2.GaussianBlur(lab[..., 1:] * (1 - mask[..., None]), (0, 0), 12) / np.maximum(cv2.GaussianBlur(1 - mask, (0, 0), 12), 1e-3)[..., None]
+    dab = cv2.resize((ab_bg - lab[..., 1:]) * mask[..., None], (w, h), interpolation=cv2.INTER_LINEAR)
+    out = img.copy()
+    for y0 in range(0, h, strip):
+        if m[y0:y0 + strip].max() < 0.01:
+            continue
+        l2 = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        l2[..., 0] += dl[y0:y0 + strip]
+        l2[..., 1:] += dab[y0:y0 + strip]
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(l2, cv2.COLOR_LAB2RGB), 0, 1)
+    return out
+
+
+def _white_surfaces(img, strip=512):
+    """White doors, trim and walls lit by warm bulbs read cream/yellow: bring bright, weakly
+    coloured warm surfaces back to clean white (real wood, beige tile etc. are more coloured)."""
+    out = np.empty_like(img)
+    for y0 in range(0, img.shape[0], strip):
+        lab = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+        C = np.hypot(a, b)
+        hue = np.degrees(np.arctan2(b, a))
+        cm = 24 + 16 * np.clip((L - 74) / 10, 0, 1)
+        w = (np.clip((L - 70) / 8, 0, 1) * np.clip((cm - C) / 6, 0, 1)
+             * np.clip(1 - np.abs(hue - 80) / 70, 0, 1))
+        cool = (np.clip((L - 66) / 8, 0, 1) * np.clip((14 - C) / 4, 0, 1)
+                * np.clip(1 - np.abs(hue + 95) / 50, 0, 1))
+        f = 1 - np.maximum(0.88 * w, 0.95 * cool)
+        lab[..., 1] = a * f
+        lab[..., 2] = b * f
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    return out
+
+
+def _wall_marks(img, strip=512):
+    """On white walls: warm/brown marks and smudges go neutral, and small dark fixtures
+    (hinges, outlets' screws, handles) lose the orange cast from warm bulbs."""
+    h, w = img.shape[:2]
+    Lf = cv2.cvtColor(np.clip(img, 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)[..., 0]
+    small = cv2.resize(Lf, (w // 4, h // 4), interpolation=cv2.INTER_AREA)
+    surround = cv2.resize(cv2.dilate(cv2.GaussianBlur(small, (0, 0), 6), np.ones((9, 9), np.uint8)), (w, h),
+                          interpolation=cv2.INTER_LINEAR)
+    del Lf, small
+    out = np.empty_like(img)
+    for y0 in range(0, h, strip):
+        lab = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+        C = np.hypot(a, b)
+        sb = np.clip((surround[y0:y0 + strip] - 74) / 6, 0, 1)  # sits on/next to a white wall
+        smudge = sb * np.clip((L - 45) / 10, 0, 1) * np.clip((36 - C) / 6, 0, 1)
+        fixture = sb * np.clip((50 - L) / 8, 0, 1)
+        f = 1 - np.maximum(0.85 * smudge, 0.8 * fixture)
+        lab[..., 1] = a * f
+        lab[..., 2] = b * f
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    del surround
+    return out
+
+
+def _soft_contrast(img, strip=512):
+    """HSH look (measured from HSH/AutoHDR finals): whites sit around 80-85 L* with their
+    shading kept instead of washing out to paper-white; dark floors a bit lighter."""
+    xs = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 85, 90, 95, 100], np.float32)
+    ys = np.array([0, 15, 29, 40, 49, 56, 63, 70, 77.5, 80.5, 84, 89, 96], np.float32)
+    out = np.empty_like(img)
+    for y0 in range(0, img.shape[0], strip):
+        lab = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        lab[..., 0] = np.interp(lab[..., 0], xs, ys)
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    return out
+
+
+def _floor_reflections(img, strip=512):
+    """Sky reflected in glossy floors shows as a bright blue patch: give it the floor's own
+    colour and pull its brightness most of the way down to the floor around it."""
+    h, w = img.shape[:2]
+    sw = 600; sh = int(round(sw * h / w))
+    lab = cv2.cvtColor(cv2.resize(np.clip(img, 0, 1), (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32), cv2.COLOR_RGB2LAB)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    hue = np.degrees(np.arctan2(b, a)); C = np.hypot(a, b)
+    wood = (np.clip(1 - np.abs(hue - 60) / 40, 0, 1) * np.clip((C - 3) / 4, 0, 1) * (L > 15) * (L < 75)).astype(np.float32)
+    near = cv2.GaussianBlur(cv2.dilate(wood, np.ones((121, 121), np.uint8)), (0, 0), 8)
+    ref = cv2.GaussianBlur(lab * wood[..., None], (0, 0), 60) / np.maximum(cv2.GaussianBlur(wood, (0, 0), 60), 1e-4)[..., None]
+    # inside the floor: wood all around (a patch on a wall, window or mirror has little wood around it)
+    dens = cv2.GaussianBlur(((L > 12) & (L < 60)).astype(np.float32), (0, 0), 25)
+    # floor on both sides (left/right) of the spot: a reflection streak, not a mark on the wall
+    sides = cv2.blur(((L > 12) & (L < 60)).astype(np.float32), (61, 3))
+    dens = np.minimum(dens, sides + 0.1)
+    cool = np.clip((ref[..., 2] - b - 13) / 6, 0, 1) * np.clip((near - 0.5) / 0.3, 0, 1) * np.clip((dens - 0.17) / 0.06, 0, 1)
+    # lower part of the photo only (floors), not windows/skies
+    yy = np.linspace(0, 1, sh)[:, None]
+    cool = cool * np.clip((yy - 0.55) / 0.08, 0, 1)
+    cool = np.clip(cv2.GaussianBlur(cv2.dilate(cool.astype(np.float32), np.ones((7, 7), np.uint8)), (0, 0), 4) * 1.3, 0, 1)
+    if cool.max() < 0.05:
+        return img
+    target_L = L - 0.45 * np.maximum(L - ref[..., 0], 0)
+    d = np.dstack([target_L - L, ref[..., 1] - a, ref[..., 2] - b]) * cool[..., None]
+    d = cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR)
+    out = img.copy()
+    for y0 in range(0, h, strip):
+        l2 = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        l2 += d[y0:y0 + strip]
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(l2, cv2.COLOR_LAB2RGB), 0, 1)
+    return out
+
+
+def _flare_tint(img, geometry, bright, strip=512):
+    """Lens-flare ghosts and daylight spill show as blue/violet blobs on white walls, ceilings
+    and mirrors. Outside the windows themselves, bright surfaces lose that cool tint."""
+    win = (bright > 0.92).astype(np.uint8)
+    win = cv2.dilate(cv2.resize(win, (bright.shape[1] // 8, bright.shape[0] // 8), interpolation=cv2.INTER_NEAREST),
+                     np.ones((5, 5), np.uint8)).astype(np.float32)
+    win = cv2.resize(cv2.GaussianBlur(win, (0, 0), 2), (bright.shape[1], bright.shape[0]), interpolation=cv2.INTER_LINEAR)
+    win = np.clip(geometry(win), 0, 1)
+    out = np.empty_like(img)
+    for y0 in range(0, img.shape[0], strip):
+        lab = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+        C = np.hypot(a, b)
+        hue = np.degrees(np.arctan2(b, a))
+        cool = (np.clip((L - 62) / 10, 0, 1) * np.clip((26 - C) / 6, 0, 1)
+                * np.clip(1 - np.abs(hue + 85) / 55, 0, 1) * (1 - win[y0:y0 + strip]))
+        f = 1 - 0.9 * cool
+        lab[..., 1] = a * f
+        lab[..., 2] = b * f
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    return out
+
+
+def _highlight_detail(img, amount=1.4, strip=512):
+    """White doors, trim and panelled walls flatten out near white: bring back their shading
+    (panel mouldings, wall grooves) with local contrast in the bright tones only. The base is
+    edge-aware, so dark objects on white walls (faucets, hinges, towel rings) get no halo."""
+    h, w = img.shape[:2]
+    Lfull = cv2.cvtColor(np.clip(img, 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)[..., 0]
+    small = cv2.resize(Lfull, (w // 4, h // 4), interpolation=cv2.INTER_AREA) / 100.0
+    base = _gf(small.astype(np.float32), small.astype(np.float32), 6, 0.0015) * 100.0
+    base = cv2.resize(base, (w, h), interpolation=cv2.INTER_LINEAR)
+    # no boost next to strong edges (dark fixtures against white)
+    ge = cv2.resize(cv2.dilate((np.abs(small - cv2.GaussianBlur(small, (0, 0), 2)) > 0.06).astype(np.uint8),
+                               np.ones((5, 5), np.uint8)).astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+    del small
+    out = np.empty_like(img)
+    for y0 in range(0, h, strip):
+        lab = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        L = lab[..., 0]
+        d = np.clip(cv2.GaussianBlur(L, (0, 0), 2.5) - base[y0:y0 + strip], -8, 8)
+        wgt = np.clip((base[y0:y0 + strip] - 65) / 10, 0, 1) * (1 - ge[y0:y0 + strip])
+        lab[..., 0] = np.clip(L + amount * d * wgt, 0, 100)
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    del Lfull, base, ge
+    return out
+
+
+def _floor_clarity(img, amount=0.9, strip=512):
+    """Crisp wood grain on floors and furniture (mid/dark tones): local contrast at grain
+    scale, so floors read sharp instead of smeared by soft reflections."""
+    h, w = img.shape[:2]
+    out = np.empty_like(img)
+    pad = 32
+    sig = max(2.0, w / 6000 * 8)
+    for y0 in range(0, h, strip):
+        a, b = max(0, y0 - pad), min(h, y0 + strip + pad)
+        lab = cv2.cvtColor(np.clip(img[a:b], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        L = lab[..., 0]
+        base = cv2.GaussianBlur(L, (0, 0), sig)
+        d = np.clip(L - base, -6, 6)
+        wgt = np.clip((base - 18) / 10, 0, 1) * np.clip((72 - base) / 10, 0, 1)
+        # glossy reflections on dark floors: soften the brightest streaks toward the floor tone
+        flo = cv2.GaussianBlur(L, (0, 0), sig * 12)
+        over = np.maximum(cv2.GaussianBlur(base, (0, 0), sig) - (flo + 8), 0) * np.clip((72 - flo) / 15, 0, 1)
+        L = L - 0.8 * over
+        lab[..., 0] = np.clip(L + amount * d * wgt, 0, 100)
+        res = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+        out[y0:y0 + strip] = res[y0 - a:y0 - a + min(strip, h - y0)]
+    return out
+
+
+def _radiance_detail(lin):
+    """Shading of bright surfaces (door panels, mouldings, wall grooves) measured in the true
+    scene light, before any tone step squeezes the highlights. Half resolution, log scale."""
+    h, w = lin.shape[:2]
+    Y = cv2.resize(lin.mean(2), (w // 2, h // 2), interpolation=cv2.INTER_AREA).astype(np.float32)
+    lg = np.log(np.maximum(Y, 1e-5))
+    base = cv2.GaussianBlur(lg, (0, 0), max(3.0, w / 2 / 400))
+    d = np.clip(lg - base, -0.25, 0.25)
+    d = cv2.GaussianBlur(d, (0, 0), 1.0)  # panel/groove scale, not noise
+    return d.astype(np.float32)
+
+
+def _apply_highlight_detail(img, geometry, d, strength=22.0, strip=512):
+    """Put that shading back into the bright, washed-out areas of the finished photo."""
+    h, w = img.shape[:2]
+    dd = cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR)
+    dd = geometry(dd)
+    out = np.empty_like(img)
+    for y0 in range(0, h, strip):
+        lab = cv2.cvtColor(np.clip(img[y0:y0 + strip], 0, 1).astype(np.float32), cv2.COLOR_RGB2LAB)
+        L = lab[..., 0]
+        Lb = cv2.GaussianBlur(L, (0, 0), 4)
+        # only where the photo is bright and has lost its own shading
+        own = np.abs(L - Lb)
+        wgt = np.clip((Lb - 76) / 6, 0, 1) * np.clip((3.0 - own) / 2.0, 0, 1)
+        lab[..., 0] = np.clip(L + strength * dd[y0:y0 + strip] * wgt, 0, 100)
+        out[y0:y0 + strip] = np.clip(cv2.cvtColor(lab, cv2.COLOR_LAB2RGB), 0, 1)
+    return out
+
+
+def _wood(img, chroma=0.85, dl=9.0, lift=24.0, strip=512):
     """Natural oak: light boards a touch richer (not pale), honey-oak doors opened up.
     Worked out on a smoothed copy so whole surfaces shift evenly and grain is kept;
     dark low-colour woods (walnut vanities) are left as they are."""
@@ -463,8 +947,22 @@ def _wood(img, chroma=1.08, dl=9.0, lift=24.0, strip=512):
     hue = np.degrees(np.arctan2(b, a))
     m = np.clip(1 - np.abs(hue - 72) / 22, 0, 1) * np.clip((C - 10) / 6, 0, 1) * np.clip((L - 15) / 10, 0, 1)
     dL = -dl * np.clip((L - 62) / 14, 0, 1) + lift * np.clip((52 - L) / 22, 0, 1) * np.clip((C - 15) / 4, 0, 1)
-    dL = cv2.GaussianBlur(m * dL, (0, 0), 3)
-    fc = cv2.GaussianBlur(1 + (chroma - 1) * m, (0, 0), 3)
+    # floors: soften big reflection streaks (large-scale light/dark) by 40%, grain untouched
+    mf = np.clip(1 - np.abs(hue - 70) / 35, 0, 1) * np.clip((C - 8) / 5, 0, 1) * np.clip((L - 20) / 10, 0, 1) * np.clip((70 - L) / 10, 0, 1)
+    mf = cv2.GaussianBlur(mf, (0, 0), 4)
+    Llo = cv2.GaussianBlur(L, (0, 0), 6)
+    Lref = cv2.GaussianBlur(L * mf, (0, 0), 60) / np.maximum(cv2.GaussianBlur(mf, (0, 0), 60), 1e-3)
+    fl = np.clip((mf - 0.3) / 0.4, 0, 1)
+    # glare = brighter AND washed-out (less coloured) than the rest of the floor; an evenly light
+    # oak floor is left alone
+    Clo = cv2.GaussianBlur(C, (0, 0), 6)
+    Cref = cv2.GaussianBlur(C * mf, (0, 0), 60) / np.maximum(cv2.GaussianBlur(mf, (0, 0), 60), 1e-3)
+    washed = np.clip((Cref - Clo - 0.5) / 3, 0, 1)
+    glare = np.maximum(Llo - Lref, 0) * washed
+    dL = cv2.GaussianBlur(m * dL, (0, 0), 3) - 0.6 * glare * fl
+    # glare washes the wood colour out: give it back where we darken
+    fc_glare = 1 + np.clip(glare / 15, 0, 1) * 0.35 * fl
+    fc = cv2.GaussianBlur((1 + (chroma - 1) * m) * fc_glare, (0, 0), 3)
     dL = cv2.resize(dL, (w, h), interpolation=cv2.INTER_LINEAR)
     fc = cv2.resize(fc, (w, h), interpolation=cv2.INTER_LINEAR)
     del sm, lab, L, a, b, C, hue, m
@@ -498,11 +996,19 @@ def process_set(bracket_set, preview_width=1200):
     frames = [f[:h, :w] for f in frames]
     mid = frames[len(frames) // 2].copy()
     bright = dark_lin = None
+    hl_detail = None
     if len(frames) > 1:
         frames = _align(frames)
-        bright = frames[0].max(2)
+        # windows = blown in a normal exposure too (with 4-5 brackets the brightest one also
+        # blows out floor reflections, which are not windows)
+        bright = frames[1 if len(frames) >= 4 else 0].max(2)
         dark_lin = _srgb_lin(frames[-1]) / 1.6
-        fused = _fuse(frames)
+        # editor-style blend: brightest photo as the base, darker photos only where it is blown
+        # (soft masks, same exposure) -> no halos around doors, no dark-bracket colour on floors
+        lin, _ = _blend_render(frames)
+        hl_detail = _radiance_detail(lin)
+        fused = _to_display(lin)
+        del lin
     else:
         fused = frames[0]
     del frames
@@ -516,9 +1022,33 @@ def process_set(bracket_set, preview_width=1200):
             img = _recover_windows(img, geometry, bright, dark_lin)
         except Exception:  # never lose a photo over the window step
             pass
+        try:
+            img = _window_tint(img, geometry, bright)
+        except Exception:
+            pass
+        try:
+            img = _flare_tint(img, geometry, bright)
+        except Exception:
+            pass
         del bright, dark_lin
         gc.collect()
     img = _wood(img)
+    img = _floor_reflections(img)
+    img = _highlight_detail(img)
+    img = _floor_clarity(img)
+    if hl_detail is not None:
+        try:
+            img = _apply_highlight_detail(img, geometry, hl_detail)
+        except Exception:
+            pass
+        del hl_detail
+    img = _soft_contrast(img)
+    try:
+        img = _deflare(img)
+    except Exception:
+        pass
+    img = _white_surfaces(img)
+    img = _wall_marks(img)
     before = cv2.resize(geometry(mid), (preview_width, int(preview_width * h / w)), interpolation=cv2.INTER_AREA)
     del mid
     out = (img * 255 + 0.5).astype(np.uint8)

@@ -119,11 +119,37 @@ class Worker(threading.Thread):
                     shutil.rmtree(os.path.join(self.store.dir(job['id']), 'raw'), ignore_errors=True)
                     os.makedirs(os.path.join(self.store.dir(job['id']), 'raw'), exist_ok=True)
                 job['status'] = 'error'
-                job['error'] = str(e)[:500]
+                job['error'] = (f"{e} (while: {job.get('message') or job.get('status')})" if str(e) and not
+                                isinstance(e, KeyError) else
+                                f"{type(e).__name__} {e} (while: {job.get('message') or job.get('status')})")[:500]
+                if isinstance(e, OSError) and e.errno == 28:
+                    job['error'] = self._space_report(job)
                 self.store.save(job)
             finally:
                 self.current = None
                 gc.collect()
+
+    def _space_report(self, job):
+        """Plain-language 'storage full' message saying what was happening and what uses the space."""
+        def size(p):
+            tot = 0
+            for dp, _, fs in os.walk(p):
+                for f in fs:
+                    try:
+                        tot += os.path.getsize(os.path.join(dp, f))
+                    except OSError:
+                        pass
+            return tot
+        try:
+            u = shutil.disk_usage(self.store.root)
+            jobs_mb = size(self.store.root) // 2**20
+            report = (f"Server storage full while: {job.get('message') or job.get('status')}. "
+                      f"Storage {u.used // 2**20} of {u.total // 2**20} MB used; HSH Studio jobs use {jobs_mb} MB. "
+                      f"Delete old jobs, or make the Railway volume bigger.")
+        except Exception:
+            report = 'Server storage full. Delete old jobs, or make the Railway volume bigger.'
+        print('[space] ' + report)
+        return report[:500]
 
     def cleanup(self):
         cutoff = time.time() - self.retention_days * 86400
@@ -196,7 +222,13 @@ class Worker(threading.Thread):
                 self.dbx.download_link_file(job['link'], rp, local)
                 infos[local] = raw_io.read_info(local)
                 if infos[local]['exposure'] is None:  # no exposure tag at all: use the RAW's brightness
-                    infos[local]['exposure'] = raw_io.quick_brightness(local) or 1.0
+                    infos[local]['exposure'] = raw_io.quick_brightness(local) or None
+                if infos[local]['exposure'] is None:
+                    # damaged or not a real RAW: skip it and keep going with the rest of the shoot
+                    with open(local, 'rb') as fh:
+                        print(f'[unreadable] {rp} size={os.path.getsize(local)} start={fh.read(16)!r}')
+                    job['failed'].append({'name': os.path.basename(rp), 'error': 'This RAW file could not be read (damaged or incomplete)'})
+                    del infos[local], remote[local]
                 os.remove(local)
             raws = sorted(set(infos) | set(remote) | {os.path.join(raw_dir, x) for x in os.listdir(raw_dir)
                                                       if raw_io.is_raw(x)})
@@ -219,6 +251,13 @@ class Worker(threading.Thread):
         # 2. group brackets
         self._set(job, 'grouping', 'Sorting brackets into photos')
         sets = pipeline.group_brackets(raws, per_set=int(job.get('per_set') or 0), infos=infos or None)
+        # safety: a "photo" with more than 7 frames means the bracket sorting went wrong;
+        # split it into the shoot's usual bracket count instead of pulling in dozens of RAWs
+        normal = [len(x) for x in sets if 2 <= len(x) <= 7]
+        common = max(set(normal), key=normal.count) if normal else 3
+        if any(len(x) > 7 for x in sets):
+            print(f'[job {job["id"]}] oversized bracket set(s) {[len(x) for x in sets if len(x) > 7]}; splitting by {common}')
+        sets = [y for x in sets for y in ([x[k:k + common] for k in range(0, len(x), common)] if len(x) > 7 else [x])]
         job['sets_total'] = len(sets)
         done_names = {p['name'] for p in job['photos']}
         self.store.save(job)
@@ -232,6 +271,11 @@ class Worker(threading.Thread):
             self._set(job, 'processing', f'Editing photo {i} of {len(sets)}')
             t0 = time.time()
             try:
+                need = sum(remote[it['path']][1] for it in s if it['path'] in remote and not os.path.exists(it['path']))
+                free = shutil.disk_usage(d).free
+                if need and free < need + 150 * 1024 * 1024:
+                    raise RuntimeError(f'Not enough free space on the server for this photo '
+                                       f'({need // 2**20} MB needed, {free // 2**20} MB free). Delete old jobs and try again.')
                 for it in s:  # fetch this photo's brackets from Dropbox
                     if it['path'] in remote and not os.path.exists(it['path']):
                         self.dbx.download_link_file(job['link'], remote[it['path']][0], it['path'])
